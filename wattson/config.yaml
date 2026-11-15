@@ -1,0 +1,27 @@
+name: "Wattson Discord Bot"
+version: "1.2"
+slug: "wattson"
+description: "Discord bot for IPMI power control and Docker container control"
+url: "https://github.com/bruceconklin/wattson"
+arch:
+  - amd64
+startup: application
+boot: auto
+options:
+  DISCORD_TOKEN: "your_token_here"
+  IPMI_HOST: "192.168.1.x"
+  IPMI_USER: "admin"
+  IPMI_PASS: "password"
+  DISCORD_GUILD_ID: "00000000"
+  DISCORD_ALLOWED_ROLE_ID: "00000000"
+  DOCKER_SSH_HOST: ""
+  DOCKER_SSH_USER: "wattson"
+schema:
+  DISCORD_TOKEN: password
+  IPMI_HOST: str
+  IPMI_USER: str
+  IPMI_PASS: password
+  DISCORD_GUILD_ID: str
+  DISCORD_ALLOWED_ROLE_ID: str
+  DOCKER_SSH_HOST: str?
+  DOCKER_SSH_USER: str?

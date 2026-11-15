@@ -1,0 +1,6 @@
+# /etc/wattson/containers
+# Containers Wattson is allowed to list, start, stop and restart.
+# One container name per line (as shown by: docker ps -a --format '{{.Names}}').
+# Anything not listed here is invisible to the bot.
+example-container-1
+example-container-2

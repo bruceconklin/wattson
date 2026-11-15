@@ -1,0 +1,62 @@
+#!/usr/bin/env bash
+# wattson-ctl: the only command Wattson's SSH key is allowed to run on the
+# Docker server. It is installed as a forced command in authorized_keys, so
+# the key cannot open a shell or run anything else.
+#
+# Wattson sends one of:
+#   list                       allowlisted containers with their state
+#   start|stop|restart <name>  act on one allowlisted container
+#   reboot                     reboot the server (needs the sudoers rule)
+set -euo pipefail
+
+ALLOWLIST_FILE="${WATTSON_ALLOWLIST:-/etc/wattson/containers}"
+NAME_RE='^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$'
+
+die() { echo "error: $*" >&2; exit 1; }
+
+# Containers Wattson may touch, one per line; blank lines and # comments ignored.
+allowlist() {
+  [[ -r "$ALLOWLIST_FILE" ]] || die "allowlist $ALLOWLIST_FILE is missing"
+  sed -e 's/#.*//' -e 's/[[:space:]]//g' "$ALLOWLIST_FILE" | grep -v '^$' || true
+}
+
+is_allowed() { allowlist | grep -qxF -- "$1"; }
+
+read -r -a ARGS <<< "${SSH_ORIGINAL_COMMAND:-${*:-}}"
+ACTION="${ARGS[0]:-}"
+TARGET="${ARGS[1]:-}"
+[[ ${#ARGS[@]} -le 2 ]] || die "too many arguments"
+
+case "$ACTION" in
+  list)
+    # Output: name<TAB>state<TAB>status, e.g. "atm10	running	Up 3 hours"
+    declare -A seen=()
+    while IFS=$'\t' read -r name state status; do
+      seen["$name"]="$state"$'\t'"$status"
+    done < <(docker ps -a --format '{{.Names}}\t{{.State}}\t{{.Status}}')
+    while IFS= read -r name; do
+      printf '%s\t%s\n' "$name" "${seen[$name]:-missing	not found}"
+    done < <(allowlist)
+    ;;
+
+  start|stop|restart)
+    [[ -n "$TARGET" ]] || die "usage: $ACTION <container>"
+    [[ "$TARGET" =~ $NAME_RE ]] || die "invalid container name"
+    is_allowed "$TARGET" || die "'$TARGET' is not on the allowlist"
+    docker "$ACTION" "$TARGET" >/dev/null
+    docker inspect -f '{{.State.Status}}' "$TARGET"
+    ;;
+
+  reboot)
+    [[ -z "$TARGET" ]] || die "reboot takes no arguments"
+    sudo -n -l /usr/bin/systemctl reboot >/dev/null 2>&1 \
+      || die "sudoers rule for 'systemctl reboot' is missing"
+    # Detach and wait a few seconds so this SSH call can return cleanly.
+    setsid -f bash -c 'sleep 3; sudo -n /usr/bin/systemctl reboot' \
+      </dev/null >/dev/null 2>&1
+    echo "rebooting"
+    ;;
+
+  "") die "no command given" ;;
+  *)  die "unknown command '$ACTION'" ;;
+esac

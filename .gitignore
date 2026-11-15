@@ -1,0 +1,16 @@
+# macOS / Samba cruft
+.DS_Store
+._*
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# Secrets never belong in this repo. Real values live in the
+# app's Configuration tab in Home Assistant.
+.env
+*.env
+options.json
+secrets*.yaml
