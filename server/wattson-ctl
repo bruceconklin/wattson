@@ -6,6 +6,10 @@
 # Wattson sends one of:
 #   list                       allowlisted containers with their state
 #   start|stop|restart <name>  act on one allowlisted container
+#   update <name>              pull the newest image for one allowlisted
+#                              container and recreate it if the image changed
+#   check                      pull the newest images and report which
+#                              allowlisted containers have an update waiting
 #   reboot                     reboot the server (needs the sudoers rule)
 set -euo pipefail
 
@@ -21,6 +25,60 @@ allowlist() {
 }
 
 is_allowed() { allowlist | grep -qxF -- "$1"; }
+
+require_target() {
+  [[ -n "$TARGET" ]] || die "usage: $ACTION <container>"
+  [[ "$TARGET" =~ $NAME_RE ]] || die "invalid container name"
+  is_allowed "$TARGET" || die "'$TARGET' is not on the allowlist"
+  docker inspect "$TARGET" >/dev/null 2>&1 </dev/null || die "container '$TARGET' does not exist"
+}
+
+inspect() { docker inspect -f "$2" "$1" </dev/null; }
+
+# Read one compose label from a container ("" if absent).
+label() {
+  local v
+  v=$(inspect "$1" "{{index .Config.Labels \"$2\"}}")
+  [[ "$v" == "<no value>" ]] && v=""
+  printf '%s' "$v"
+}
+
+# Rebuild the exact `docker compose` invocation that created a container, from
+# the labels Compose stamps on it. Sets COMPOSE (array) and SERVICE.
+compose_for() {
+  local c="$1" wd files project envfiles f
+  wd=$(label "$c" com.docker.compose.project.working_dir)
+  files=$(label "$c" com.docker.compose.project.config_files)
+  project=$(label "$c" com.docker.compose.project)
+  envfiles=$(label "$c" com.docker.compose.project.environment_file)
+  SERVICE=$(label "$c" com.docker.compose.service)
+  [[ -n "$wd" && -n "$files" && -n "$project" && -n "$SERVICE" ]] \
+    || die "'$c' wasn't created by docker compose, so it can't be updated safely"
+  [[ -d "$wd" && -r "$wd" && -x "$wd" ]] \
+    || die "the wattson user can't read the compose folder $wd (see SETUP.md)"
+
+  COMPOSE=(docker compose --project-directory "$wd" -p "$project")
+  IFS=',' read -r -a list <<< "$files"
+  for f in "${list[@]}"; do
+    [[ -r "$f" ]] || die "the wattson user can't read $f (see SETUP.md)"
+    COMPOSE+=(-f "$f")
+  done
+  if [[ -n "$envfiles" ]]; then
+    IFS=',' read -r -a list <<< "$envfiles"
+    for f in "${list[@]}"; do
+      [[ -r "$f" ]] || die "the wattson user can't read $f (see SETUP.md)"
+      COMPOSE+=(--env-file "$f")
+    done
+  fi
+}
+
+# Run a compose step; on failure, report the last few lines of its output.
+run_compose() {
+  local out
+  if ! out=$("${COMPOSE[@]}" "$@" 2>&1 </dev/null); then
+    die "docker compose $1 failed: $(tail -n 3 <<< "$out" | tr '\n' ' ')"
+  fi
+}
 
 read -r -a ARGS <<< "${SSH_ORIGINAL_COMMAND:-${*:-}}"
 ACTION="${ARGS[0]:-}"
@@ -40,11 +98,62 @@ case "$ACTION" in
     ;;
 
   start|stop|restart)
-    [[ -n "$TARGET" ]] || die "usage: $ACTION <container>"
-    [[ "$TARGET" =~ $NAME_RE ]] || die "invalid container name"
-    is_allowed "$TARGET" || die "'$TARGET' is not on the allowlist"
+    require_target
     docker "$ACTION" "$TARGET" >/dev/null
-    docker inspect -f '{{.State.Status}}' "$TARGET"
+    inspect "$TARGET" '{{.State.Status}}'
+    ;;
+
+  update)
+    # Output: updated|recreated|current<TAB>image<TAB>state
+    #   updated    new image, container recreated on it
+    #   recreated  same image, but the compose file had changed since the
+    #              last deploy, so the container was rebuilt from it
+    #   current    already up to date, nothing touched
+    require_target
+    compose_for "$TARGET"
+    old_id=$(inspect "$TARGET" '{{.Image}}')
+    old_cid=$(inspect "$TARGET" '{{.Id}}')
+    was_running=$(inspect "$TARGET" '{{.State.Running}}')
+
+    run_compose pull --quiet "$SERVICE"
+    # Recreates only if the image (or compose config) changed; otherwise it's
+    # a no-op and the game keeps running. A stopped game stays stopped.
+    if [[ "$was_running" == "true" ]]; then
+      run_compose up -d --no-deps "$SERVICE"
+    else
+      run_compose up --no-start --no-deps "$SERVICE"
+    fi
+
+    new_id=$(inspect "$TARGET" '{{.Image}}')
+    new_cid=$(inspect "$TARGET" '{{.Id}}')
+    result=current
+    [[ "$new_cid" != "$old_cid" ]] && result=recreated
+    [[ "$new_id" != "$old_id" ]] && result=updated
+    printf '%s\t%s\t%s\n' "$result" "$(inspect "$TARGET" '{{.Config.Image}}')" \
+      "$(inspect "$TARGET" '{{.State.Status}}')"
+    ;;
+
+  check)
+    # Output: name<TAB>available|current|skipped<TAB>detail
+    # Pulls the newest images (downloads only; nothing is restarted), so a
+    # later `update` is quick.
+    [[ -z "$TARGET" ]] || die "check takes no arguments"
+    while IFS= read -r name; do
+      if ! docker inspect "$name" >/dev/null 2>&1 </dev/null; then
+        printf '%s\tskipped\tnot found\n' "$name"; continue
+      fi
+      image=$(inspect "$name" '{{.Config.Image}}')
+      running_id=$(inspect "$name" '{{.Image}}')
+      if ! docker pull -q "$image" >/dev/null 2>&1 </dev/null; then
+        printf '%s\tskipped\tcould not pull %s\n' "$name" "$image"; continue
+      fi
+      latest_id=$(docker image inspect -f '{{.Id}}' "$image" </dev/null)
+      if [[ "$latest_id" != "$running_id" ]]; then
+        printf '%s\tavailable\t%s\n' "$name" "$image"
+      else
+        printf '%s\tcurrent\t%s\n' "$name" "$image"
+      fi
+    done < <(allowlist)
     ;;
 
   reboot)

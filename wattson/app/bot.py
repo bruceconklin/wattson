@@ -30,6 +30,7 @@ DOCKER_SSH_HOST = os.environ.get("DOCKER_SSH_HOST", "").strip()
 DOCKER_SSH_USER = os.environ.get("DOCKER_SSH_USER", "").strip() or "wattson"
 SSH_DIR = os.environ.get("WATTSON_SSH_DIR", "/data/ssh")
 DOCKER_TIMEOUT = 120  # seconds; stopping a game server can take a while
+UPDATE_TIMEOUT = 600  # seconds; pulling a big game image can take a few minutes
 CONTAINER_CACHE_TTL = 60  # seconds between container list refreshes for autocomplete
 
 CONTAINER_NAME_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,127}")
@@ -148,6 +149,56 @@ async def docker_action(action: str, name: str) -> str:
     state = await run_ctl(action, name)
     _container_cache["at"] = 0.0  # state changed; refresh on next autocomplete
     return f"{STATE_EMOJI.get(state, '❔')} `{name}` is now **{state}**."
+
+
+def state_label(state: str) -> str:
+    # A stopped game recreated on a new image reports "created"; to a person it's just stopped.
+    return "stopped" if state in ("exited", "created") else state
+
+
+async def docker_update(name: str) -> str:
+    out = await run_ctl("update", name, timeout=UPDATE_TIMEOUT)
+    _container_cache["at"] = 0.0
+    parts = out.split("\t")
+    if len(parts) != 3:
+        return f"❔ Unexpected reply from the Docker server: `{out}`"
+    result, image, state = parts
+    where = f"and is **{state_label(state)}**"
+    if result == "updated":
+        return f"✅ `{name}` updated to the latest `{image}` {where}."
+    if result == "recreated":
+        return (
+            f"♻️ `{name}` was already on the latest `{image}`, but its compose file had changed "
+            f"since it was last deployed, so it was rebuilt from it {where}."
+        )
+    return (
+        f"✅ `{name}` is already on the latest `{image}`. Nothing changed.\n"
+        "Games that download their own updates on start (common with SteamCMD servers) "
+        "pick up new versions with `/docker restart` instead."
+    )
+
+
+async def docker_check() -> str:
+    out = await run_ctl("check", timeout=UPDATE_TIMEOUT)
+    lines, waiting = [], 0
+    for line in out.splitlines():
+        parts = line.split("\t")
+        if len(parts) != 3:
+            continue
+        name, status, detail = parts
+        if status == "available":
+            waiting += 1
+            lines.append(f"🆕 `{name}`: update available")
+        elif status == "current":
+            lines.append(f"✅ `{name}`: up to date")
+        else:
+            lines.append(f"⚪ `{name}`: skipped ({detail})")
+    if not lines:
+        return "No containers are on the allowlist yet (/etc/wattson/containers on the Docker server)."
+    if waiting:
+        lines.append("\nRun `/docker update` on a game to apply its update. It's already downloaded, so it's quick.")
+    lines.append("SteamCMD games that update themselves on start won't show here; `/docker restart` updates those.")
+    return "\n".join(lines)
 
 
 async def container_names_for_autocomplete() -> list[str]:
@@ -438,6 +489,30 @@ async def docker_restart(interaction: discord.Interaction, container: str):
         working_text=f"🔁 Restarting `{container}`…",
         action=lambda: docker_action("restart", container),
     )
+
+
+@docker.command(name="update", description="Update a container to its latest image (requires confirmation)")
+@app_commands.describe(container="Container name")
+@app_commands.autocomplete(container=container_autocomplete)
+async def docker_update_cmd(interaction: discord.Interaction, container: str):
+    if not await guard(interaction) or not await valid_container(interaction, container):
+        return
+    await ask_confirm(
+        interaction,
+        f"⚠️ **Update `{container}`?** This pulls its latest image and, if there's a new one, "
+        "recreates the container. Anyone connected will be dropped if it updates.",
+        command="/docker update",
+        confirm_label="Confirm update",
+        working_text=f"⬇️ Updating `{container}`… this can take a few minutes.",
+        action=lambda: docker_update(container),
+    )
+
+
+@docker.command(name="updates", description="Check which containers have a newer image (changes nothing)")
+async def docker_updates_cmd(interaction: discord.Interaction):
+    if not await guard(interaction):
+        return
+    await respond_with(interaction, docker_check)
 
 
 async def reboot_reply() -> str:
