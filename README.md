@@ -35,11 +35,44 @@ and `.env` it was deployed from:
 - If the image is already current, nothing is touched.
 - If the compose file was edited since the last deploy, the container is rebuilt from it.
 
-How a game actually updates depends on its image:
+How a game actually updates depends on how it's packaged:
 
-- **Image-based** (for example Factorio): a new image is the update, so `/docker update` handles it.
+- **Published image** (for example `factoriotools/factorio` or `itzg/minecraft-server`): a new image is the update, so `/docker update` handles it.
 - **Self-updating on start** (many SteamCMD servers): the image rarely changes; the game downloads its update when it starts, so `/docker restart` is the update.
-- **Pinned versions** (for example a modpack version set in compose): edit the version in the compose file on the server, then `/docker update` applies it.
+- **Pinned versions in a published image** (for example a modpack version set in compose): edit the version in the compose file on the server, then `/docker update` applies it.
+- **Built locally with a pinned version**: see below.
+
+### Version-tracked builds
+
+If a game's image is built from your own Dockerfile and its version is a build
+argument, Wattson can track it against an upstream version feed. Keep the
+version in the project's `.env` and add three labels to the compose service:
+
+```yaml
+# compose.yaml
+services:
+  factorio:
+    build:
+      context: .
+      args:
+        FACTORIO_VERSION: "${FACTORIO_VERSION:?set FACTORIO_VERSION in .env}"
+    labels:
+      wattson.version-var: FACTORIO_VERSION                       # variable in .env
+      wattson.version-url: https://factorio.com/api/latest-releases  # JSON feed
+      wattson.version-path: stable.headless                        # where in the JSON
+```
+
+```bash
+# .env
+FACTORIO_VERSION=2.0.77
+```
+
+Then:
+
+- `/docker updates` compares the `.env` version with the feed, for example `2.0.77 → 2.0.78`.
+- `/docker update` writes the new version to `.env`, runs `docker compose build`, and recreates the container. If the build fails, the old version goes back into `.env` and the running game isn't touched.
+
+The `wattson` user needs write access to that one `.env` file (see [server/SETUP.md](server/SETUP.md), step 3c). A locally built game without these labels shows as skipped.
 
 ## Repo layout
 

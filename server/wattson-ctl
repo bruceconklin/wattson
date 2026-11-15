@@ -6,15 +6,28 @@
 # Wattson sends one of:
 #   list                       allowlisted containers with their state
 #   start|stop|restart <name>  act on one allowlisted container
-#   update <name>              pull the newest image for one allowlisted
-#                              container and recreate it if the image changed
-#   check                      pull the newest images and report which
-#                              allowlisted containers have an update waiting
+#   update <name>              bring one allowlisted container up to date
+#   check                      report which allowlisted containers have an
+#                              update waiting (changes nothing that's running)
 #   reboot                     reboot the server (needs the sudoers rule)
+#
+# Two kinds of updates:
+#   image    The container runs a published image (e.g. itzg/minecraft-server).
+#            Updating = docker compose pull + up for that one service.
+#   version  The image is built locally from a Dockerfile and the game version
+#            is pinned in the project's .env. The compose service opts in with
+#            three labels:
+#              wattson.version-var:  FACTORIO_VERSION      (variable in .env)
+#              wattson.version-url:  https://factorio.com/api/latest-releases
+#              wattson.version-path: stable.headless       (where in the JSON)
+#            Updating = write the newest version to .env, docker compose build,
+#            then up for that one service.
 set -euo pipefail
 
 ALLOWLIST_FILE="${WATTSON_ALLOWLIST:-/etc/wattson/containers}"
 NAME_RE='^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$'
+VAR_RE='^[A-Za-z_][A-Za-z0-9_]{0,63}$'
+VERSION_RE='^[A-Za-z0-9][A-Za-z0-9._+-]{0,63}$'
 
 die() { echo "error: $*" >&2; exit 1; }
 
@@ -35,7 +48,7 @@ require_target() {
 
 inspect() { docker inspect -f "$2" "$1" </dev/null; }
 
-# Read one compose label from a container ("" if absent).
+# Read one label from a container ("" if absent).
 label() {
   local v
   v=$(inspect "$1" "{{index .Config.Labels \"$2\"}}")
@@ -43,8 +56,15 @@ label() {
   printf '%s' "$v"
 }
 
+# Compose names locally built images "<project>-<service>".
+is_local_build() {
+  local c="$1"
+  [[ "$(inspect "$c" '{{.Config.Image}}')" == \
+     "$(label "$c" com.docker.compose.project)-$(label "$c" com.docker.compose.service)" ]]
+}
+
 # Rebuild the exact `docker compose` invocation that created a container, from
-# the labels Compose stamps on it. Sets COMPOSE (array) and SERVICE.
+# the labels Compose stamps on it. Sets COMPOSE (array), SERVICE and ENV_FILE.
 compose_for() {
   local c="$1" wd files project envfiles f
   wd=$(label "$c" com.docker.compose.project.working_dir)
@@ -63,22 +83,80 @@ compose_for() {
     [[ -r "$f" ]] || die "the wattson user can't read $f (see SETUP.md)"
     COMPOSE+=(-f "$f")
   done
+  ENV_FILE="$wd/.env"
   if [[ -n "$envfiles" ]]; then
     IFS=',' read -r -a list <<< "$envfiles"
     for f in "${list[@]}"; do
       [[ -r "$f" ]] || die "the wattson user can't read $f (see SETUP.md)"
       COMPOSE+=(--env-file "$f")
     done
+    ENV_FILE="${list[0]}"
   fi
 }
 
 # Run a compose step; on failure, report the last few lines of its output.
+compose_try() { COMPOSE_OUT=$("${COMPOSE[@]}" "$@" 2>&1 </dev/null); }
 run_compose() {
-  local out
-  if ! out=$("${COMPOSE[@]}" "$@" 2>&1 </dev/null); then
-    die "docker compose $1 failed: $(tail -n 3 <<< "$out" | tr '\n' ' ')"
+  compose_try "$@" || die "docker compose $1 failed: $(tail -n 3 <<< "$COMPOSE_OUT" | tr '\n' ' ')"
+}
+
+# Bring the service up again the way it was: running stays running, stopped stays stopped.
+redeploy() {
+  if [[ "$1" == "true" ]]; then
+    run_compose up -d --no-deps "$SERVICE"
+  else
+    run_compose up --no-start --no-deps "$SERVICE"
   fi
 }
+
+# --- version-tracked builds ----------------------------------------------
+
+# Value of VAR in an env file, without surrounding quotes ("" if unset).
+env_get() {
+  [[ -r "$1" ]] || { printf ''; return; }
+  sed -n "s/^$2=//p" "$1" | tail -n 1 | sed -e "s/^[\"']//" -e "s/[\"']\$//"
+}
+
+# Set VAR=VALUE in an env file. Writes the file in place, so only write access
+# to the file itself is needed (not to its folder) and its permissions stay.
+env_set() {
+  local content
+  content=$(awk -v k="$2" -v v="$3" '
+    $0 ~ "^" k "=" { if (!done) print k "=" v; done = 1; next }
+    { print }
+    END { if (!done) print k "=" v }' "$1")
+  printf '%s\n' "$content" > "$1"
+}
+
+# Latest version from the feed in the container's labels. Sets VAR, CURRENT, LATEST.
+version_info() {
+  local c="$1" url path wd envfile
+  VAR=$(label "$c" wattson.version-var)
+  url=$(label "$c" wattson.version-url)
+  path=$(label "$c" wattson.version-path)
+  [[ "$VAR" =~ $VAR_RE ]] || die "label wattson.version-var on '$c' isn't a valid variable name"
+  [[ "$url" == https://* ]] || die "label wattson.version-url on '$c' must be an https:// URL"
+  [[ -n "$path" ]] || die "label wattson.version-path on '$c' is missing"
+  command -v python3 >/dev/null || die "python3 is needed to read the version feed"
+
+  wd=$(label "$c" com.docker.compose.project.working_dir)
+  envfile=$(label "$c" com.docker.compose.project.environment_file)
+  ENV_FILE="${envfile%%,*}"
+  [[ -n "$ENV_FILE" ]] || ENV_FILE="$wd/.env"
+  [[ -r "$ENV_FILE" ]] || die "the wattson user can't read $ENV_FILE (see SETUP.md)"
+  CURRENT=$(env_get "$ENV_FILE" "$VAR")
+  [[ -n "$CURRENT" ]] || die "$VAR isn't set in $ENV_FILE"
+
+  LATEST=$(curl -fsSL --max-time 20 "$url" </dev/null 2>/dev/null | python3 -c '
+import json, sys
+v = json.load(sys.stdin)
+for key in sys.argv[1].split("."):
+    v = v[key]
+print(v)' "$path" 2>/dev/null) || die "couldn't read the latest version from $url ($path)"
+  [[ "$LATEST" =~ $VERSION_RE ]] || die "the version feed returned something unexpected"
+}
+
+# -------------------------------------------------------------------------
 
 read -r -a ARGS <<< "${SSH_ORIGINAL_COMMAND:-${*:-}}"
 ACTION="${ARGS[0]:-}"
@@ -104,54 +182,87 @@ case "$ACTION" in
     ;;
 
   update)
-    # Output: updated|recreated|current<TAB>image<TAB>state
-    #   updated    new image, container recreated on it
-    #   recreated  same image, but the compose file had changed since the
-    #              last deploy, so the container was rebuilt from it
-    #   current    already up to date, nothing touched
+    # Output: result<TAB>kind<TAB>detail<TAB>state
+    #   result  updated    moved to a newer image or version
+    #           recreated  same image, but the compose file had changed since
+    #                      the last deploy, so the container was rebuilt from it
+    #           current    already up to date, nothing touched
+    #   kind    image (detail = image reference) or version (detail = versions)
     require_target
     compose_for "$TARGET"
     old_id=$(inspect "$TARGET" '{{.Image}}')
     old_cid=$(inspect "$TARGET" '{{.Id}}')
     was_running=$(inspect "$TARGET" '{{.State.Running}}')
 
+    if [[ -n "$(label "$TARGET" wattson.version-var)" ]]; then
+      version_info "$TARGET"
+      if [[ "$LATEST" == "$CURRENT" ]]; then
+        printf 'current\tversion\t%s\t%s\n' "$CURRENT" "$(inspect "$TARGET" '{{.State.Status}}')"
+        exit 0
+      fi
+      [[ -w "$ENV_FILE" ]] || die "the wattson user can't write $ENV_FILE (see SETUP.md)"
+      env_set "$ENV_FILE" "$VAR" "$LATEST"
+      if ! compose_try build "$SERVICE"; then
+        env_set "$ENV_FILE" "$VAR" "$CURRENT"   # put the old pin back
+        die "build of $LATEST failed, still on $CURRENT: $(tail -n 3 <<< "$COMPOSE_OUT" | tr '\n' ' ')"
+      fi
+      redeploy "$was_running"
+      printf 'updated\tversion\t%s → %s\t%s\n' "$CURRENT" "$LATEST" "$(inspect "$TARGET" '{{.State.Status}}')"
+      exit 0
+    fi
+
+    is_local_build "$TARGET" \
+      && die "'$TARGET' is built locally; add the wattson.version labels to its compose service to track updates (see README)"
+
     run_compose pull --quiet "$SERVICE"
     # Recreates only if the image (or compose config) changed; otherwise it's
     # a no-op and the game keeps running. A stopped game stays stopped.
-    if [[ "$was_running" == "true" ]]; then
-      run_compose up -d --no-deps "$SERVICE"
-    else
-      run_compose up --no-start --no-deps "$SERVICE"
-    fi
+    redeploy "$was_running"
 
     new_id=$(inspect "$TARGET" '{{.Image}}')
     new_cid=$(inspect "$TARGET" '{{.Id}}')
     result=current
     [[ "$new_cid" != "$old_cid" ]] && result=recreated
     [[ "$new_id" != "$old_id" ]] && result=updated
-    printf '%s\t%s\t%s\n' "$result" "$(inspect "$TARGET" '{{.Config.Image}}')" \
+    printf '%s\timage\t%s\t%s\n' "$result" "$(inspect "$TARGET" '{{.Config.Image}}')" \
       "$(inspect "$TARGET" '{{.State.Status}}')"
     ;;
 
   check)
-    # Output: name<TAB>available|current|skipped<TAB>detail
-    # Pulls the newest images (downloads only; nothing is restarted), so a
-    # later `update` is quick.
+    # Output: name<TAB>available|current|skipped<TAB>kind<TAB>detail
+    # Image kind pulls the newest images (downloads only; nothing is
+    # restarted), so a later `update` is quick. Version kind only reads the feed.
     [[ -z "$TARGET" ]] || die "check takes no arguments"
     while IFS= read -r name; do
       if ! docker inspect "$name" >/dev/null 2>&1 </dev/null; then
-        printf '%s\tskipped\tnot found\n' "$name"; continue
+        printf '%s\tskipped\t-\tnot found\n' "$name"; continue
+      fi
+      if [[ -n "$(label "$name" wattson.version-var)" ]]; then
+        if ! err=$( (version_info "$name" && printf '%s\t%s' "$CURRENT" "$LATEST") 2>&1 ); then
+          err="${err##*$'\n'}"   # last line only, keeps the one-line-per-container format
+          printf '%s\tskipped\tversion\t%s\n' "$name" "${err#error: }"; continue
+        fi
+        IFS=$'\t' read -r CURRENT LATEST <<< "$err"
+        if [[ "$LATEST" != "$CURRENT" ]]; then
+          printf '%s\tavailable\tversion\t%s → %s\n' "$name" "$CURRENT" "$LATEST"
+        else
+          printf '%s\tcurrent\tversion\t%s\n' "$name" "$CURRENT"
+        fi
+        continue
+      fi
+      if is_local_build "$name"; then
+        printf '%s\tskipped\t-\tbuilt locally; add wattson.version labels to track updates\n' "$name"; continue
       fi
       image=$(inspect "$name" '{{.Config.Image}}')
       running_id=$(inspect "$name" '{{.Image}}')
       if ! docker pull -q "$image" >/dev/null 2>&1 </dev/null; then
-        printf '%s\tskipped\tcould not pull %s\n' "$name" "$image"; continue
+        printf '%s\tskipped\timage\tcould not pull %s\n' "$name" "$image"; continue
       fi
       latest_id=$(docker image inspect -f '{{.Id}}' "$image" </dev/null)
       if [[ "$latest_id" != "$running_id" ]]; then
-        printf '%s\tavailable\t%s\n' "$name" "$image"
+        printf '%s\tavailable\timage\t%s\n' "$name" "$image"
       else
-        printf '%s\tcurrent\t%s\n' "$name" "$image"
+        printf '%s\tcurrent\timage\t%s\n' "$name" "$image"
       fi
     done < <(allowlist)
     ;;

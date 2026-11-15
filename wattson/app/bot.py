@@ -160,19 +160,27 @@ async def docker_update(name: str) -> str:
     out = await run_ctl("update", name, timeout=UPDATE_TIMEOUT)
     _container_cache["at"] = 0.0
     parts = out.split("\t")
-    if len(parts) != 3:
+    if len(parts) == 3:  # older wattson-ctl: result, image, state
+        parts.insert(1, "image")
+    if len(parts) != 4:
         return f"❔ Unexpected reply from the Docker server: `{out}`"
-    result, image, state = parts
+    result, kind, detail, state = parts
     where = f"and is **{state_label(state)}**"
+
+    if kind == "version":
+        if result == "updated":
+            return f"✅ `{name}` updated ({detail}) {where}."
+        return f"✅ `{name}` is already on the latest version, {detail}. Nothing changed."
+
     if result == "updated":
-        return f"✅ `{name}` updated to the latest `{image}` {where}."
+        return f"✅ `{name}` updated to the latest `{detail}` {where}."
     if result == "recreated":
         return (
-            f"♻️ `{name}` was already on the latest `{image}`, but its compose file had changed "
+            f"♻️ `{name}` was already on the latest `{detail}`, but its compose file had changed "
             f"since it was last deployed, so it was rebuilt from it {where}."
         )
     return (
-        f"✅ `{name}` is already on the latest `{image}`. Nothing changed.\n"
+        f"✅ `{name}` is already on the latest `{detail}`. Nothing changed.\n"
         "Games that download their own updates on start (common with SteamCMD servers) "
         "pick up new versions with `/docker restart` instead."
     )
@@ -183,20 +191,24 @@ async def docker_check() -> str:
     lines, waiting = [], 0
     for line in out.splitlines():
         parts = line.split("\t")
-        if len(parts) != 3:
+        if len(parts) == 3:  # older wattson-ctl: name, status, detail
+            parts.insert(2, "image")
+        if len(parts) != 4:
             continue
-        name, status, detail = parts
+        name, status, kind, detail = parts
         if status == "available":
             waiting += 1
-            lines.append(f"🆕 `{name}`: update available")
+            extra = f" ({detail})" if kind == "version" else ""
+            lines.append(f"🆕 `{name}`: update available{extra}")
         elif status == "current":
-            lines.append(f"✅ `{name}`: up to date")
+            extra = f" ({detail})" if kind == "version" else ""
+            lines.append(f"✅ `{name}`: up to date{extra}")
         else:
             lines.append(f"⚪ `{name}`: skipped ({detail})")
     if not lines:
         return "No containers are on the allowlist yet (/etc/wattson/containers on the Docker server)."
     if waiting:
-        lines.append("\nRun `/docker update` on a game to apply its update. It's already downloaded, so it's quick.")
+        lines.append("\nRun `/docker update` on a game to apply its update.")
     lines.append("SteamCMD games that update themselves on start won't show here; `/docker restart` updates those.")
     return "\n".join(lines)
 

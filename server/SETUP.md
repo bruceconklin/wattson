@@ -71,6 +71,26 @@ sudo setfacl -R -d -m u:wattson:rX "$GAMES"          # and anything added later
 
 If a game lives somewhere else, repeat the last three lines for that folder.
 
+## 3c. Version-tracked builds only: let Wattson update the pinned version
+
+For a game built from your own Dockerfile and tracked with the
+`wattson.version-*` labels (see the README), `/docker update` rewrites the
+version line in that project's `.env`. Give `wattson` write access to that one
+file, and make sure `python3` and `curl` are installed (they read the version
+feed):
+
+```bash
+sudo setfacl -m u:wattson:rw /home/YOU/games/factorio/.env
+command -v python3 curl
+```
+
+Also add a `.dockerignore` next to the Dockerfile that excludes the game's
+data folder, so builds don't copy your saves into the build context:
+
+```bash
+echo 'factorio/' > /home/YOU/games/factorio/.dockerignore
+```
+
 ## 4. Allow the reboot (and nothing else) through sudo
 
 ```bash
